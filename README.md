@@ -17,6 +17,10 @@ kernels + a continual harness + recursive subagents, driven by a local model
   `skill_descriptions`, `subagent_specs`) with snapshot rollback. Injected as
   `NOTES` into every child kernel at boot. Workers auto-distill outcomes back
   into `memories` (the RL feedback loop).
+- **Kernels survive crashes** — each kernel's user namespace is snapshotted
+  with dill (per-variable, 256 MB cap) and restored on start. A stale
+  dead-pid index entry is cleaned up and the session revived automatically,
+  so a crash or reboot does not lose in-flight state.
 - **Recursion** — a child can delegate to its own children (LLM: JSON actions
   `run_child` / `child_result` / `list_children`; deterministic: `run_child()`
   / `child_result()` helpers), bounded by depth (default 3). Parents block on
@@ -51,7 +55,7 @@ rlmlab rlm mailbox --child rlm_xxx
 
 ## CLI reference
 
-- `kernel start|exec|stop|list|reap --max-age-seconds N`
+- `kernel start|exec|stop|list|reap --max-age-seconds N|snapshot|restore --session S`
 - `harness get|refine --section --item|snapshots|rollback --version N`
 - `goals create|list|done|drop`
 - `rlm run|submit|send|list|mailbox`
@@ -68,4 +72,15 @@ rlmlab rlm mailbox --child rlm_xxx
 The LLM executor speaks the OpenAI chat-completions protocol. Target the
 llama.cpp server (`:8080`, e.g. Qwen3.6-35B-A3B) or ollama (`:11434`). On an
 8 GB laptop GPU with a 35B IQ2 model, expect ~7 tok/s; reduce the llama.cpp
-`-c` context (currently 262144) to reclaim VRAM/RAM for a significant speedup.
+`-c` context to reclaim VRAM/RAM for a significant speedup (hermes, for
+example, refuses to start below a 64k context floor).
+
+## Running as services
+
+- **Model server** — a systemd user unit (`qwen.service` → `~/bin/qwen-start`)
+  serves the llama.cpp model with `-c 65000`.
+- **Ambient worker** — `rlmlab-work.timer` (every 5 min) drains admitted
+  children, or `rlmlab work supervise` runs a foreground loop.
+- **RLM gate test driver** — `rlm-gate.service` runs a checkpointed story
+  transcript against a live hermes session to exercise the context-summary
+  gates; see `/home/a/rlm-gate-story/README.md`.
