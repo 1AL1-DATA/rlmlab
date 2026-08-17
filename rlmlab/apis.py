@@ -16,6 +16,7 @@ live view of which APIs are reachable.
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -75,9 +76,23 @@ _PROBE_PATHS = {
 }
 
 
+_DISCOVER_CACHE = {"ts": 0, "found": {}}
+_DISCOVER_TTL_MS = 30_000
+
+
 def auto_discover():
     """Probe llama + ollama defaults and scan common ports for live endpoints.
-    Returns {name: config} for all discovered instances."""
+    Returns {name: config} for all discovered instances.
+
+    The probe sweep is sequential and slow (defaults + up to ~20 ports x 2
+    endpoints); it runs inside every ``resolve``/``get_api`` call, which the
+    worker hits once per task — including deterministic tasks that never
+    touch a model. The result is cached for a short TTL so the hot path
+    pays for discovery at most once per 30 s regardless of task volume.
+    """
+    now = time.time() * 1000
+    if _DISCOVER_CACHE["found"] and now - _DISCOVER_CACHE["ts"] < _DISCOVER_TTL_MS:
+        return _DISCOVER_CACHE["found"]
     found = {}
     # Defaults
     for api_type, cfg in (("llama", DEFAULT_LLAMA), ("ollama", DEFAULT_OLLAMA)):
@@ -91,6 +106,8 @@ def auto_discover():
             if _probe(url, path):
                 name = f"{api_type}-{port}"
                 found[name] = {"type": api_type, "base_url": url}
+    _DISCOVER_CACHE["found"] = found
+    _DISCOVER_CACHE["ts"] = now
     return found
 
 

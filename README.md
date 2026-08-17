@@ -2,7 +2,7 @@
 
 A recursive language-machine harness (prime-agent style): persistent IPython
 kernels + a continual harness + recursive subagents, driven by a local model
-(llama.cpp / ollama). Adapters expose it to opencode and hermes.
+(llama.cpp / ollama). Everything is reachable through the `rlmlab` CLI.
 
 ## Mental model
 
@@ -33,9 +33,10 @@ kernels + a continual harness + recursive subagents, driven by a local model
    systemd).
 2. **Task file** — `rlmlab rlm submit task.md` (`# title` first line, body is
    the prompt) admits a child.
-3. **opencode / hermes** — the plugins expose the same operations as tools
-   (`rlm_run`, `rlm_mailbox`, `harness_refine`, `kernel_exec`, …). You talk to
-   the agent; it calls the harness.
+3. **JSON tools** — the CLI has a machine-readable output mode
+   (`rlmlab --format json …`), so the same operations (`rlm.run`,
+   `harness.refine`, `kernel.exec`, `work.once`, …) can be exposed by an
+   agent or a plugin that shells out to the CLI. See `rlmlab --help`.
 4. **Ambient worker** — the systemd user timer
    (`rlmlab-work.timer`, every 5 min) or `rlmlab work supervise` drains
    admitted children without you doing anything.

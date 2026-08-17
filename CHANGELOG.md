@@ -33,3 +33,42 @@ not yet tagged.
 ### Misc
 - `_extract_json` also parses array-shaped LLM responses.
 - Added `dill` and `ruff` (dev) dependencies.
+
+## Unreleased (2nd round — review fixes)
+
+### Correctness
+- **Stuck-subagent fix**: `_process_one` now marks a child `failed` on every
+  exit path — `kernel.start()` failure, failed note injection, failed llm
+  exec, failed code exec, or any unexpected exception. Previously a
+  `kernel.start()` failure or an exception left the child `running` forever.
+- **Stale-running recovery**: `work_once` requeues children stuck in
+  `running` whose claim is older than 10 min and whose kernel is dead
+  (`_requeue_stale_running`), so a worker killed mid-run (kill -9, crash)
+  no longer strands a child permanently. New `subagents.requeue`.
+- **Atomic claim**: `subagents.claim` now takes a per-child flock around the
+  read-modify-write, so two racing workers (or worker + CLI) can never
+  double-claim a child.
+- **Harness write lock**: `harness.refine` takes a flock around the
+  read-modify-write; concurrent writers no longer lose updates.
+- **API discovery hot path**: `apis.auto_discover` caches probe results for
+  30 s. Previously the sequential port sweep (defaults + ~20 ports x 2
+  probes) ran on every `resolve` — i.e. once per task, even deterministic
+  ones that never touch a model.
+- **Retry on model calls**: `agent_loop._complete` retries connection-level
+  failures and 5xx responses twice with backoff before giving up; 4xx
+  (config errors) fail fast.
+
+### Features
+- **Goals wired in**: open goals are injected into every child's preamble
+  (`NOTES["goals"]`), and `rlmlab goals work --id G` admits a subagent from
+  a goal's text and marks it done.
+- **Scoped memory retrieval**: `_distill_notes` now pulls top-k memories by
+  keyword overlap with the task prompt, capped at an 8 KB budget, instead of
+  dumping up to 500 memories into every child.
+- **Usage telemetry persisted**: llm executor stores `turns`/`tokens` in the
+  child record (`meta`), surfaced by `rlmlab rlm list`.
+
+### CI / docs
+- Added `.github/workflows/ci.yml` (ruff + pytest on push/PR).
+- README no longer claims opencode/hermes plugins ship in this repo (they
+  don't); points to the CLI's `--format json` instead.

@@ -29,7 +29,7 @@ def test_wrangler_picks_and_runs_from_queue():
     assert payload["ok"] is True
     assert "42" in payload.get("text", "")
 
-    picked = [r for r in subagents.list_subagents() if r.get("name") == "pickme"][0]
+    picked = next(r for r in subagents.list_subagents() if r.get("name") == "pickme")
     assert picked["status"] == "done"
     assert "42" in subagents.child_result(picked["rlm_child_id"]).get("result", "")
 

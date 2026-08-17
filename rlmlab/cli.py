@@ -65,6 +65,9 @@ def main(argv=None):
     g_done.add_argument("--id", required=True)
     g_drop = gs.add_parser("drop", parents=[common])
     g_drop.add_argument("--id", required=True)
+    g_work = gs.add_parser("work", parents=[common], help="admit a subagent from an open goal's text")
+    g_work.add_argument("--id", required=True)
+    g_work.add_argument("--api", default=None)
 
     p = sub.add_parser("rlm", help="recursive subagents (admission handles + mailboxes)", parents=[common])
     rs = p.add_subparsers(dest="action", required=True)
@@ -190,6 +193,15 @@ def dispatch_goals(args):
         return goals.done(args.id)
     if args.action == "drop":
         return goals.drop(args.id)
+    if args.action == "work":
+        goal = next((g for g in goals.list_goals() if g["id"] == args.id), None)
+        if goal is None:
+            return {"ok": False, "error": f"no goal {args.id}"}
+        if goal["status"] != "open":
+            return {"ok": False, "error": f"goal {args.id} is {goal['status']!r}, only open goals can be worked"}
+        admitted = subagents.run(goal["text"][:64], goal["text"], api=args.api)
+        goals.done(args.id)
+        return {"ok": True, "child": admitted["rlm_child_id"], "goal": args.id}
     return {"ok": False, "error": "unknown goals action"}
 
 
@@ -348,7 +360,9 @@ def print_human(tool, action, result):
             print(f"{result['child']} -> api {result['api']}")
         elif action == "list":
             for s in result["subagents"]:
-                print(f"{s['rlm_child_id']} [{s['status']}] api={s.get('api','deterministic')} {s['name']}")
+                meta = s.get("meta", {})
+                suffix = f" turns={meta.get('turns')} tokens={meta.get('tokens')}" if meta else ""
+                print(f"{s['rlm_child_id']} [{s['status']}] api={s.get('api','deterministic')} {s['name']}{suffix}")
         elif action == "mailbox":
             for m in result["messages"]:
                 print(f"[{m['from']}] {m['text']}")

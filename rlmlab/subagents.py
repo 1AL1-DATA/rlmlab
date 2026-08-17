@@ -4,6 +4,7 @@ Matches prime-agent's invariant: rlm(...) returns an admission handle
 immediately (never the child's answer); results arrive later as messages.
 """
 
+import fcntl
 import json
 import os
 import time
@@ -72,15 +73,26 @@ def claim(child_id):
     Returns the claimed record, or None if the agent is not 'admitted'
     (already running, done, or failed) -- so a crashed or re-run worker
     can never double-process an agent (claim-before-effects).
+
+    The transition is a read-modify-write on admission.json, so it takes a
+    per-child flock to be atomic even without the worker's global lock
+    (two workers, or a worker + manual CLI racing).
     """
-    record = _find(child_id)
-    if record is None or record.get("status") != "admitted":
-        return None
-    record["status"] = "running"
-    record["started_ts"] = int(time.time() * 1000)
-    _write(record)
-    _bust_list_cache()
-    return record
+    lock_path = os.path.join(SUBAGENTS_DIR, child_id, "claim.lock")
+    try:
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record = _find(child_id)
+            if record is None or record.get("status") != "admitted":
+                return None
+            record["status"] = "running"
+            record["started_ts"] = int(time.time() * 1000)
+            _write(record)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            _bust_list_cache()
+            return record
+    except OSError:
+        return None  # another claim is in flight; treat as already claimed
 
 
 def set_api(child_id, api):
@@ -96,7 +108,23 @@ def set_api(child_id, api):
     return {"ok": True, "child": child_id, "api": record["api"]}
 
 
-def complete(child_id, result, error=None):
+def requeue(child_id):
+    """Reset a stuck 'running' child back to 'admitted' so a future drain
+    re-claims it. Used by the stale-running recovery in worker.work_once."""
+    record = _find(child_id)
+    if record is None:
+        return {"ok": False, "error": f"no subagent {child_id}"}
+    if record.get("status") != "running":
+        return {"ok": False, "error": f"cannot requeue: status is {record.get('status')!r}"}
+    record["status"] = "admitted"
+    record["started_ts"] = None
+    record.pop("error", None)
+    _write(record)
+    _bust_list_cache()
+    return {"ok": True, "child": child_id}
+
+
+def complete(child_id, result, error=None, meta=None):
     """Record a worker result in the mailbox and flip status -> done|failed."""
     record = _find(child_id)
     if record is None:
@@ -115,6 +143,8 @@ def complete(child_id, result, error=None):
     record["completed_ts"] = int(time.time() * 1000)
     if error:
         record["error"] = error
+    if meta:
+        record["meta"] = {**record.get("meta", {}), **meta}
     _write(record)
     _bust_list_cache()
     return {"ok": True, "status": status}

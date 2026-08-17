@@ -73,7 +73,7 @@ def _extract_json(content):
     return None
 
 
-def _complete(base_url, model, messages, timeout=120):
+def _complete(base_url, model, messages, timeout=120, retries=2):
     if urllib.parse.urlparse(base_url).scheme not in ("http", "https"):
         raise ValueError(f"unsupported base_url scheme: {base_url!r}")
     body = json.dumps(
@@ -90,16 +90,28 @@ def _complete(base_url, model, messages, timeout=120):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - scheme validated above (http/https only)
-        data = json.loads(resp.read())
-    message = data["choices"][0]["message"]
-    usage = data.get("usage", {})
-    return (
-        message.get("content") or "",
-        message.get("reasoning_content") or "",
-        usage.get("prompt_tokens", 0),
-        usage.get("completion_tokens", 0),
-    )
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - scheme validated above (http/https only)
+                data = json.loads(resp.read())
+            message = data["choices"][0]["message"]
+            usage = data.get("usage", {})
+            return (
+                message.get("content") or "",
+                message.get("reasoning_content") or "",
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            # ponytail: retry only connection-level failures; a 4xx with a
+            # readable body is a config error, not a blip worth retrying.
+            last = e
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500:
+                raise
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    raise last  # type: ignore[misc]
 
 
 def run_llm(

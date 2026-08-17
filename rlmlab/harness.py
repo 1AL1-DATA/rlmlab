@@ -1,5 +1,6 @@
 """Continual harness state: durable playbook with snapshot-based rollback."""
 
+import fcntl
 import json
 import os
 import time
@@ -36,19 +37,28 @@ def get_state():
 
 
 def refine(section, item):
+    """Append an entry under a flock so concurrent writers (background
+    worker + manual CLI) never lose an update to the read-modify-write."""
     _ensure()
-    state = get_state()
-    if section not in EMPTY_STATE:
-        return {"ok": False, "error": f"unknown section {section!r}"}
-    state[section].append({"text": item, "added": int(time.time() * 1000)})
-    if section == "memories" and len(state["memories"]) > MEMORY_CAP:
-        state["memories"] = state["memories"][-MEMORY_CAP:]
-    state["version"] += 1
-    _write(state)
-    # ponytail: snapshot only every SNAPSHOT_INTERVAL refinements, not every call
-    if state["version"] % SNAPSHOT_INTERVAL == 1:
-        _snapshot({k: list(v) if isinstance(v, list) else v for k, v in state.items()})
-    return {"ok": True, "version": state["version"], "section": section, "count": len(state[section])}
+    lock_path = STATE_FILE + ".lock"
+    with open(lock_path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"ok": False, "error": "harness is busy (another writer holds the lock)"}
+        state = get_state()
+        if section not in EMPTY_STATE:
+            return {"ok": False, "error": f"unknown section {section!r}"}
+        state[section].append({"text": item, "added": int(time.time() * 1000)})
+        if section == "memories" and len(state["memories"]) > MEMORY_CAP:
+            state["memories"] = state["memories"][-MEMORY_CAP:]
+        state["version"] += 1
+        _write(state)
+        # ponytail: snapshot only every SNAPSHOT_INTERVAL refinements, not every call
+        if state["version"] % SNAPSHOT_INTERVAL == 1:
+            _snapshot({k: list(v) if isinstance(v, list) else v for k, v in state.items()})
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return {"ok": True, "version": state["version"], "section": section, "count": len(state[section])}
 
 
 def list_snapshots():

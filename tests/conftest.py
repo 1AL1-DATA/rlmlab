@@ -8,7 +8,7 @@ import pytest
 _tmp = tempfile.mkdtemp(prefix="rlmlab_test_")
 os.environ["RLMLAB_HOME"] = os.path.join(_tmp, ".rlmlab")
 
-from rlmlab import harness, subagents  # noqa: E402
+from rlmlab import harness, subagents
 
 
 @pytest.fixture(autouse=True)

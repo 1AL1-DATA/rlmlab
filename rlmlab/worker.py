@@ -14,9 +14,10 @@ double-process (claim-before-effects).
 import fcntl
 import json
 import os
+import re
 import time
 
-from . import agent_loop, apis, harness, kernel, subagents
+from . import agent_loop, apis, goals, harness, kernel, subagents
 
 LOCK_FILE = os.path.join(subagents.HOME, "worker.lock")
 
@@ -80,12 +81,46 @@ def claim_and_run(child_id, timeout=90):
 """
 
 
-def _distill_notes():
+_MEMORY_BUDGET_CHARS = 8_000
+_MEMORY_K = 20
+
+
+def _retrieve_memories(memories, query, k=_MEMORY_K, max_chars=_MEMORY_BUDGET_CHARS):
+    """Top-k memories by keyword overlap with the task prompt, capped at a
+    token budget. Without this the harness dumps up to MEMORY_CAP entries
+    into every child, which is both a token firehose and undifferentiated
+    context. Scoring is bag-of-words overlap — deliberately simple."""
+    if not memories:
+        return []
+    tokens = {w for w in re.findall(r"[a-zA-Z0-9_]{3,}", query.lower())}
+    if not tokens:
+        return memories[:k]
+    scored = []
+    for m in memories:
+        body = m.lower() if isinstance(m, str) else ""
+        hit = sum(1 for t in tokens if t in body)
+        if hit:
+            scored.append((hit, len(body), m))
+    picked, used = [], 0
+    for _hit, _len, m in sorted(scored, reverse=True):
+        if used + len(m) > max_chars:
+            break
+        picked.append(m)
+        used += len(m)
+    return picked or memories[:k]
+
+
+def _distill_notes(query=None):
     state = harness.get_state()
     notes = {}
-    for section in ("prompt_notes", "memories", "skill_descriptions", "subagent_specs"):
+    for section in ("prompt_notes", "skill_descriptions", "subagent_specs"):
         entries = state.get(section, [])
         notes[section] = [e.get("text") if isinstance(e, dict) else e for e in entries]
+    notes["memories"] = _retrieve_memories(
+        [e.get("text") if isinstance(e, dict) else e for e in state.get("memories", [])],
+        query or "",
+    )
+    notes["goals"] = [g["text"] for g in goals.list_goals(status="open")]
     return notes
 
 
@@ -158,6 +193,7 @@ def _process_one(record, timeout, executor, llm_opts, _depth=0):
     child_id = record["rlm_child_id"]
     prompt_text = subagents.prompt(child_id)
     if prompt_text is None:
+        subagents.complete(child_id, "", error="missing prompt.txt")
         return {"ok": False, "error": "missing prompt.txt"}
 
     resolved = apis.resolve(record.get("api") or "deterministic") or {"executor": "deterministic"}
@@ -170,7 +206,9 @@ def _process_one(record, timeout, executor, llm_opts, _depth=0):
 
     started = kernel.start(child_id)
     if started.get("ok") is False:
-        return started
+        error = started.get("error", "kernel start failed")
+        subagents.complete(child_id, "", error=error)
+        return {"ok": False, "child": child_id, "error": error}
 
     try:
         if executor == "llm":
@@ -178,7 +216,7 @@ def _process_one(record, timeout, executor, llm_opts, _depth=0):
             notes_ok = kernel.exec_code(
                 child_id,
                 _inject_preamble(
-                    _distill_notes(), child_id, record.get("depth", 0), "llm", timeout, max_depth, wrangler=wrangler
+                    _distill_notes(prompt_text), child_id, record.get("depth", 0), "llm", timeout, max_depth, wrangler=wrangler
                 ),
                 timeout=30,
             )
@@ -205,12 +243,16 @@ def _process_one(record, timeout, executor, llm_opts, _depth=0):
                 subagents.complete(child_id, "", error=result.get("error", "llm execution failed"))
                 _distill_feedback(record, False, result.get("error", "llm execution failed"))
                 return {"ok": False, "child": child_id, "error": result["error"][:1000]}
-            subagents.complete(child_id, result["answer"])
+            subagents.complete(
+                child_id,
+                result["answer"],
+                meta={"turns": result.get("turns"), "tokens": result.get("tokens")},
+            )
             _distill_feedback(record, True, result["answer"])
             return {"ok": True, "child": child_id, "text": result["answer"], "turns": result["turns"]}
 
         code = _inject_preamble(
-            _distill_notes(), child_id, record.get("depth", 0), "deterministic", timeout, agent_loop.DEFAULT_MAX_DEPTH,
+            _distill_notes(prompt_text), child_id, record.get("depth", 0), "deterministic", timeout, agent_loop.DEFAULT_MAX_DEPTH,
             wrangler=wrangler,
         ) + "\n" + prompt_text
         result = kernel.exec_code(child_id, code, timeout=timeout)
@@ -222,6 +264,10 @@ def _process_one(record, timeout, executor, llm_opts, _depth=0):
             text = text[:MAX_RESULT_LENGTH] + "\n...[truncated]"
         subagents.complete(child_id, text)
         return {"ok": True, "child": child_id, "text": text}
+    except Exception as e:  # noqa: BLE001 - any failure must mark the child failed, never strand it
+        error = f"{type(e).__name__}: {e}"
+        subagents.complete(child_id, "", error=error)
+        return {"ok": False, "child": child_id, "error": error[:1000]}
     finally:
         kernel.stop(child_id)
 
@@ -272,6 +318,27 @@ def reap(max_age_seconds=3600):
     return {"ok": True, "reaped": reaped, "stale": stale}
 
 
+def _requeue_stale_running(max_age_seconds=600):
+    """Reset children stuck in 'running' whose kernel is gone and whose
+    claim is older than max_age back to 'admitted' so a future drain picks
+    them up again. A worker killed mid-run (kill -9, crash) leaves a child
+    claimed-but-never-completed; without this it is stranded forever."""
+    now = int(time.time() * 1000)
+    requeued = []
+    for r in subagents.list_subagents():
+        if r.get("status") != "running":
+            continue
+        started_ts = r.get("started_ts") or 0
+        if now - started_ts < max_age_seconds * 1000:
+            continue
+        idx = kernel._read_index(r["rlm_child_id"])
+        if idx is not None and kernel._pid_alive(idx):
+            continue  # a live kernel means a worker is genuinely still processing it
+        subagents.requeue(r["rlm_child_id"])
+        requeued.append(r["rlm_child_id"])
+    return requeued
+
+
 def work_once(limit=None, timeout=DEFAULT_TIMEOUT, executor="deterministic", llm_opts=None, api=None):
     lock = open(LOCK_FILE, "w")  # noqa: SIM115 - lock handle must stay open across the whole function
     try:
@@ -281,6 +348,7 @@ def work_once(limit=None, timeout=DEFAULT_TIMEOUT, executor="deterministic", llm
 
     processed = []
     try:
+        requeued = _requeue_stale_running()
         admitted = [r for r in subagents.list_subagents() if r.get("status") == "admitted"]
         if api:
             admitted = [r for r in admitted if r.get("api") == api]
@@ -290,7 +358,7 @@ def work_once(limit=None, timeout=DEFAULT_TIMEOUT, executor="deterministic", llm
                 continue
             result = _process_one(claimed, timeout, executor, llm_opts or {})
             processed.append(result)
-        return {"ok": True, "processed": processed}
+        return {"ok": True, "processed": processed, "requeued": requeued}
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()

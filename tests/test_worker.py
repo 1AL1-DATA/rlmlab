@@ -1,6 +1,5 @@
-import os
-
 import fcntl
+import time
 
 from rlmlab import agent_loop, harness, subagents, worker
 
@@ -58,3 +57,41 @@ def test_extract_json_variants():
     wrapped = agent_loop._extract_json('here is my json {"action":"final","answer":"y"} thanks')
     assert wrapped == {"action": "final", "answer": "y"}
     assert agent_loop._extract_json("not json at all") is None
+
+
+def test_stuck_child_recovered_requeued():
+    """A child left 'running' by a crash (no kernel alive, claim old) is
+    reset to 'admitted' so a later drain re-runs it."""
+    rec = subagents.run("stuck1", "print('stuck')")
+    # simulate a crash: claim it, then make the claim look stale with no kernel
+    rec["status"] = "running"
+    rec["started_ts"] = int(time.time() * 1000) - 7200_000
+    subagents._write(rec)
+    subagents._bust_list_cache()
+    requeued = worker._requeue_stale_running(max_age_seconds=60)
+    assert rec["rlm_child_id"] in requeued
+    record = subagents._find(rec["rlm_child_id"])
+    assert record["status"] == "admitted"
+
+
+def test_claim_atomic_under_concurrent_claims():
+    """Two racing claims on the same child must yield exactly one winner."""
+    rec = subagents.run("race1", "print('x')")
+    cid = rec["rlm_child_id"]
+    winners = 0
+    # serialized claim calls: second must return None because first flipped it
+    first = subagents.claim(cid)
+    second = subagents.claim(cid)
+    if first is not None:
+        winners += 1
+    if second is not None:
+        winners += 1
+    assert winners == 1
+
+
+def test_memory_retrieval_top_k():
+    memories = ["kittens are soft and warm", "puppies bark loudly", "rust ownership moves data"]
+    got = worker._retrieve_memories(memories, "kittens vs dogs", k=2)
+    assert "kittens" in got[0]
+    got2 = worker._retrieve_memories(memories, "unrelated query", k=2)
+    assert len(got2) == 2
