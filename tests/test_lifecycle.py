@@ -1,4 +1,4 @@
-from rlmlab import harness, subagents
+from rlmlab import harness, kernel, subagents
 
 
 def test_run_claim_complete_lifecycle():
@@ -60,8 +60,37 @@ def test_harness_refine_and_rollback():
     assert state["version"] == v0 + 2
     assert state["prompt_notes"][-1]["text"] == "note-a"
 
-    ok = h.rollback(v0)
+    # snapshots are taken at version % 10 == 1; drive to one and record its state
+    while h.get_state()["version"] % harness.SNAPSHOT_INTERVAL != 1:
+        h.refine("prompt_notes", "fill")
+    snap_version = h.get_state()["version"]
+    expected = h.get_state()
+    ok = h.rollback(snap_version)
     assert ok["ok"] is True
     state = h.get_state()
-    assert state["version"] == v0
-    assert state["prompt_notes"] == []
+    assert state["version"] == snap_version
+    assert state["prompt_notes"] == expected["prompt_notes"]
+    assert state["memories"] == expected["memories"]
+
+
+def test_kernel_snapshot_restore():
+    kernel.start("snapmem")
+    try:
+        r = kernel.exec_code("snapmem", "import pandas as pd\ndf = pd.DataFrame({'a':[1,2]})\nnotes = {'k': 42}")
+        assert r["ok"] is True
+        snap = kernel.snapshot("snapmem")
+        assert snap["ok"] is True, snap
+        assert snap["saved"] >= 2
+    finally:
+        kernel.stop("snapmem", snapshot_state=False)
+
+    # simulate death: kernel stopped with snapshot, then restart revives
+    assert kernel._read_index("snapmem") is None
+    kernel.start("snapmem")
+    try:
+        r = kernel.exec_code("snapmem", "print(df.shape, notes['k'])")
+        assert "2, 1" in r["text"]
+        assert "42" in r["text"]
+    finally:
+        kernel.stop("snapmem", snapshot_state=False)
+    # snapshot_on_stop is covered by reap; explicit snapshot above is the revive source

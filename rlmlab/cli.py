@@ -39,6 +39,10 @@ def main(argv=None):
     k_stop.add_argument("--session", required=True)
     k_reap = ks.add_parser("reap", parents=[common])
     k_reap.add_argument("--max-age-seconds", type=int, default=3600)
+    k_snap = ks.add_parser("snapshot", parents=[common])
+    k_snap.add_argument("--session", required=True)
+    k_restore = ks.add_parser("restore", parents=[common])
+    k_restore.add_argument("--session", required=True)
     ks.add_parser("list", parents=[common])
 
     p = sub.add_parser("harness", help="continual harness state", parents=[common])
@@ -156,6 +160,10 @@ def dispatch_kernel(args):
         return kernel.stop(args.session)
     if args.action == "reap":
         return worker.reap(max_age_seconds=args.max_age_seconds)
+    if args.action == "snapshot":
+        return {"ok": True, "snapshot": kernel.snapshot(args.session)}
+    if args.action == "restore":
+        return kernel.restore(args.session)
     if args.action == "list":
         return {"ok": True, "sessions": kernel.list_sessions()}
     return {"ok": False, "error": "unknown kernel action"}
@@ -263,6 +271,8 @@ def build_schema():
         "kernel.exec": {"args": {"session": "string", "code": "string", "timeout": "int?"}},
         "kernel.stop": {"args": {"session": "string"}},
         "kernel.reap": {"args": {"max_age_seconds": "int?"}},
+        "kernel.snapshot": {"args": {"session": "string"}},
+        "kernel.restore": {"args": {"session": "string"}},
         "kernel.list": {"args": {}},
         "harness.get": {"args": {}},
         "harness.refine": {"args": {"section": "string", "item": "string"}},
@@ -308,6 +318,10 @@ def print_human(tool, action, result):
         elif action == "list":
             for s in result["sessions"]:
                 print(f"{s['name']}  last_active={s.get('last_active')}")
+        elif action == "snapshot":
+            print(f"snapshot: saved={result['snapshot'].get('saved')} skipped={result['snapshot'].get('skipped')} bytes={result['snapshot'].get('bytes')}")
+        elif action == "restore":
+            print(f"restored: {result.get('restored')}")
     elif tool == "harness":
         if action == "get":
             print(json.dumps(result["state"], indent=2))

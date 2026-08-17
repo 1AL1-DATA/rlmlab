@@ -7,8 +7,9 @@ is stopped explicitly via `rlmlab kernel stop`.
 
 import json
 import os
+import queue
 import signal
-import subprocess
+import subprocess  # nosec B404 - only used to launch the ipykernel child (shell=False, static argv)
 import time
 import uuid
 
@@ -20,6 +21,18 @@ LOG_DIR = os.path.join(HOME, "logs")
 
 KERNEL_SPEC = "python3"
 
+SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
+SNAPSHOT_MARKER = "__RLMLAB_SNAP__"
+RESTORE_MARKER = "__RLMLAB_RESTORE__"
+
+
+def _state_path(name):
+    return os.path.join(KERNELS_DIR, _safe(name) + ".state.dill")
+
+
+def _manifest_path(name):
+    return os.path.join(KERNELS_DIR, _safe(name) + ".state.manifest.json")
+
 
 def _ensure_dirs():
     os.makedirs(KERNELS_DIR, exist_ok=True)
@@ -28,8 +41,11 @@ def _ensure_dirs():
 
 def start(name):
     _ensure_dirs()
-    if _read_index(name) is not None:
-        return _error_result(f"kernel session {name!r} already exists (stop it first)")
+    existing = _read_index(name)
+    if existing is not None:
+        if _pid_alive(existing):
+            return _error_result(f"kernel session {name!r} already exists (stop it first)")
+        _cleanup(name)  # stale dead-pid index; fresh start restores the dill snapshot
     km = KernelManager(kernel_name=KERNEL_SPEC)
     km.write_connection_file()
     stable_conn = os.path.join(KERNELS_DIR, _safe(name) + ".connection.json")
@@ -42,7 +58,7 @@ def start(name):
     env.pop("JPY_PARENT_PID", None)
     log_path = os.path.join(LOG_DIR, _safe(name) + ".log")
     with open(log_path, "ab") as log:
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # nosec B603 - argv from KernelManager, shell=False, no user input
             cmd,
             env=env,
             start_new_session=True,
@@ -71,14 +87,137 @@ def start(name):
         "last_active": int(time.time() * 1000),
     }
     _write_index(name, session)
+    restored = restore(name)
+    session["restored"] = restored
+    _write_index(name, session)
     return session
 
 
-def exec_code(name, code, timeout=120):
-    _ensure_dirs()
+def _snapshot_code(out_path, manifest_path, max_bytes):
+    """Python run inside the kernel: dill-serialize user_ns per-variable,
+    skipping unpicklable names, to out_path + a JSON manifest."""
+    return f"""
+import builtins as _b, json, os
+try:
+    import dill
+except Exception as _err:
+    _b.print("{SNAPSHOT_MARKER}" + json.dumps({{"error": "dill unavailable: " + _b.str(_err)}}))
+else:
+    dill.settings["recurse"] = True
+    _ip = get_ipython()
+    _ns = _ip.user_ns if _ip is not None else _b.globals()
+    _hidden = _b.set(_b.getattr(_ip, "user_ns_hidden", {{}}) or {{}}) if _ip is not None else _b.set()
+    _always_skip = {{"rlm", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open", "_"}}
+    _payload = {{}}
+    _skipped = []
+    _total = 0
+    for _name, _val in list(_ns.items()):
+        if _name in _always_skip or _name in _hidden or _name.startswith("_"):
+            continue
+        try:
+            _blob = dill.dumps(_val)
+        except Exception as _e:
+            _skipped.append({{"name": _name, "reason": _b.str(_e)[:200]}})
+            continue
+        if _total + _b.len(_blob) > {max_bytes}:
+            _skipped.append({{"name": _name, "reason": "over max bytes"}})
+            continue
+        _payload[_name] = _blob
+        _total += _b.len(_blob)
+    try:
+        import tempfile
+        _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname({out_path!r}))
+        with os.fdopen(_fd, "wb") as _f:
+            dill.dump(_payload, _f)
+        os.replace(_tmp, {out_path!r})
+    except Exception as _e:
+        _b.print("{SNAPSHOT_MARKER}" + json.dumps({{"error": _b.str(_e)}}))
+    else:
+        with open({manifest_path!r}, "w") as _f:
+            json.dump({{"saved": _b.sorted(_payload), "skipped": _skipped, "bytes": _total}}, _f)
+        _b.print("{SNAPSHOT_MARKER}" + json.dumps({{"saved": _b.len(_payload), "skipped": _b.len(_skipped), "bytes": _total}}))
+"""
+
+
+def _restore_code(in_path):
+    """Python run inside the kernel: revive user_ns from a dill snapshot."""
+    return f"""
+import builtins as _b, json
+try:
+    import dill
+except Exception as _err:
+    _b.print("{RESTORE_MARKER}" + json.dumps({{"error": "dill unavailable: " + _b.str(_err)}}))
+else:
+    dill.settings["recurse"] = True
+    _ip = get_ipython()
+    _ns = _ip.user_ns if _ip is not None else _b.globals()
+    try:
+        with open({in_path!r}, "rb") as _f:
+            _payload = dill.load(_f)
+    except Exception as _e:
+        _b.print("{RESTORE_MARKER}" + json.dumps({{"error": "load failed: " + _b.str(_e)}}))
+    else:
+        _restored = []
+        _failed = []
+        for _name, _blob in _payload.items():
+            try:
+                _ns[_name] = dill.loads(_blob)
+                _restored.append(_name)
+            except Exception as _e:
+                _failed.append({{"name": _name, "reason": _b.str(_e)[:200]}})
+        _b.print("{RESTORE_MARKER}" + json.dumps({{"restored": _restored, "failed": _failed}}))
+"""
+
+
+def snapshot(name, timeout=120):
+    """Best-effort dill snapshot of a kernel's user namespace."""
     idx = _read_index(name)
     if idx is None:
-        return _error_result(f"no kernel session named {name!r} (start one first)")
+        return _error_result(f"no kernel session named {name!r}")
+    result = _run_raw(idx, _snapshot_code(_state_path(name), _manifest_path(name), SNAPSHOT_MAX_BYTES), timeout)
+    if not result.get("ok"):
+        return result
+    payload = _parse_marker(result, SNAPSHOT_MARKER)
+    if payload is None:
+        return _error_result("snapshot marker not found in kernel output")
+    if payload.get("error"):
+        return _error_result(payload["error"])
+    payload["ok"] = True
+    payload["path"] = _state_path(name)
+    return payload
+
+
+def restore(name, timeout=120):
+    """Restore a kernel's user namespace from its snapshot (if any)."""
+    idx = _read_index(name)
+    if idx is None:
+        return _error_result(f"no kernel session named {name!r}")
+    path = _state_path(name)
+    if not os.path.exists(path):
+        return {"ok": True, "restored": [], "note": "no snapshot"}
+    result = _run_raw(idx, _restore_code(path), timeout)
+    if not result.get("ok"):
+        return result
+    payload = _parse_marker(result, RESTORE_MARKER)
+    if payload is None:
+        return _error_result("restore marker not found in kernel output")
+    if payload.get("error"):
+        return _error_result(payload["error"])
+    payload["path"] = path
+    return payload
+
+
+def _parse_marker(result, marker):
+    text = result.get("text", "") or ""
+    idx = text.find(marker)
+    if idx < 0:
+        return None
+    start = idx + len(marker)
+    return json.loads(text[start:start + 4096].strip())
+
+
+def _run_raw(idx, code, timeout):
+    """Execute code against an existing kernel index without touching last_active."""
     km = KernelManager()
     km.load_connection_file(idx["connection_file"])
     client = km.client()
@@ -86,25 +225,40 @@ def exec_code(name, code, timeout=120):
     try:
         client.wait_for_ready(timeout=30)
         msg_id = client.execute(code)
-        result = _collect(client, msg_id, timeout)
-        _touch(name)
-        return result
-    except Exception as e:
+        return _collect(client, msg_id, timeout)
+    except Exception as e:  # noqa: BLE001 - surface any kernel transport failure as an error result
         return _error_result(f"kernel not responsive: {e}")
     finally:
         client.stop_channels()
 
 
-def stop(name):
+def exec_code(name, code, timeout=120):
+    _ensure_dirs()
+    idx = _read_index(name)
+    if idx is None:
+        return _error_result(f"no kernel session named {name!r} (start one first)")
+    result = _run_raw(idx, code, timeout)
+    if result.get("ok"):
+        _touch(name)
+    return result
+
+
+def stop(name, snapshot_state=True):
     idx = _read_index(name)
     if idx is None:
         return {"ok": False, "error": f"no kernel session named {name!r}"}
+    snap = None
+    if snapshot_state and _pid_alive(idx):
+        snap = snapshot(name)
     try:
         os.kill(idx["pid"], signal.SIGTERM)
     except ProcessLookupError:
         pass
     _cleanup(name)
-    return {"ok": True, "stopped": name}
+    out = {"ok": True, "stopped": name}
+    if snap is not None and snap.get("ok") is False:
+        out["snapshot_error"] = snap.get("error")
+    return out
 
 
 def list_sessions():
@@ -142,7 +296,7 @@ def _kernel_ready(connection_file):
         try:
             client.wait_for_ready(timeout=5)
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001 - probe returns False on any failure
             return False
     finally:
         client.stop_channels()
@@ -153,8 +307,16 @@ def _safe(name):
 
 
 def _write_index(name, session):
-    with open(os.path.join(KERNELS_DIR, _safe(name) + ".json"), "w") as f:
-        json.dump(session, f)
+    import tempfile
+    path = os.path.join(KERNELS_DIR, _safe(name) + ".json")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(session, f)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def _read_index(name):
@@ -185,16 +347,20 @@ def _touch(name):
 
 
 def _collect(client, msg_id, timeout):
+    """Collect IOPub messages until idle status or timeout.
+    Uses short polling intervals to reduce CPU churn.
+    """
     outputs = []
     errors = []
     start = time.time()
+    poll_interval = 0.1  # ponytail: use 0.1s poll; switch to select() if CPU matters
     while True:
         if time.time() - start > timeout:
             errors.append(f"execution timed out after {timeout}s")
             break
         try:
-            msg = client.get_iopub_msg(timeout=1)
-        except Exception:
+            msg = client.get_iopub_msg(timeout=poll_interval)
+        except queue.Empty:  # timeout is the normal poll path; keep polling until deadline
             continue
         if msg["parent_header"].get("msg_id") != msg_id:
             continue
