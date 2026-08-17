@@ -12,12 +12,22 @@ import uuid
 HOME = os.environ.get("RLMLAB_HOME", os.path.expanduser("~/.rlmlab"))
 SUBAGENTS_DIR = os.path.join(HOME, "subagents")
 
+# ponytail: in-memory index for list_subagents; rebuild every 5s
+_list_cache = {"data": None, "ts": 0}
+_LIST_CACHE_TTL_MS = 5_000
+
+
+def _bust_list_cache():
+    _list_cache["data"] = None
+    _list_cache["ts"] = 0
+
 
 def _ensure():
     os.makedirs(SUBAGENTS_DIR, exist_ok=True)
 
 
 def run(name, prompt, parent=None, depth=0, api=None, wrangler=False):
+    _bust_list_cache()
     _ensure()
     child_id = "rlm_" + uuid.uuid4().hex[:16]
     session_dir = os.path.join(SUBAGENTS_DIR, child_id)
@@ -69,6 +79,7 @@ def claim(child_id):
     record["status"] = "running"
     record["started_ts"] = int(time.time() * 1000)
     _write(record)
+    _bust_list_cache()
     return record
 
 
@@ -105,6 +116,7 @@ def complete(child_id, result, error=None):
     if error:
         record["error"] = error
     _write(record)
+    _bust_list_cache()
     return {"ok": True, "status": status}
 
 
@@ -145,6 +157,9 @@ def child_result(child_id):
 
 
 def list_subagents():
+    now = int(time.time() * 1000)
+    if _list_cache["data"] is not None and now - _list_cache["ts"] < _LIST_CACHE_TTL_MS:
+        return _list_cache["data"]
     _ensure()
     out = []
     for entry in sorted(os.listdir(SUBAGENTS_DIR)):
@@ -152,6 +167,8 @@ def list_subagents():
         if os.path.exists(path):
             with open(path) as f:
                 out.append(json.load(f))
+    _list_cache["data"] = out
+    _list_cache["ts"] = now
     return out
 
 
@@ -179,6 +196,13 @@ def _find(child_id):
 
 
 def _write(record):
+    import tempfile
     path = os.path.join(SUBAGENTS_DIR, record["rlm_child_id"], "admission.json")
-    with open(path, "w") as f:
-        json.dump(record, f, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(record, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise

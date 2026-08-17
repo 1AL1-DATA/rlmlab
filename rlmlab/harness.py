@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 import time
 
 HOME = os.environ.get("RLMLAB_HOME", os.path.expanduser("~/.rlmlab"))
@@ -19,6 +18,7 @@ EMPTY_STATE = {
 }
 
 MEMORY_CAP = 500
+SNAPSHOT_INTERVAL = 10  # only snapshot every N refinements
 
 
 def _ensure():
@@ -40,14 +40,14 @@ def refine(section, item):
     state = get_state()
     if section not in EMPTY_STATE:
         return {"ok": False, "error": f"unknown section {section!r}"}
-    previous = {k: list(v) for k, v in state.items() if isinstance(v, list)}
-    previous["version"] = state["version"]
-    _snapshot(previous)
     state[section].append({"text": item, "added": int(time.time() * 1000)})
     if section == "memories" and len(state["memories"]) > MEMORY_CAP:
         state["memories"] = state["memories"][-MEMORY_CAP:]
     state["version"] += 1
     _write(state)
+    # ponytail: snapshot only every SNAPSHOT_INTERVAL refinements, not every call
+    if state["version"] % SNAPSHOT_INTERVAL == 1:
+        _snapshot({k: list(v) if isinstance(v, list) else v for k, v in state.items()})
     return {"ok": True, "version": state["version"], "section": section, "count": len(state[section])}
 
 
@@ -77,5 +77,13 @@ def _snapshot(state):
 
 
 def _write(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    # Atomic write: temp file + os.replace to prevent corruption on kill
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        os.unlink(tmp)
+        raise

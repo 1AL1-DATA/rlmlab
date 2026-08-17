@@ -131,8 +131,8 @@ def _distill_feedback(record, ok, text):
         note = f"subagent '{name}' failed: {snippet}"
     try:
         harness.refine("memories", note)
-    except Exception:
-        pass
+    except (OSError, ValueError):
+        pass  # best-effort distillation; a failed memory write must not fail the subagent
 
 
 def _wait_child(child_id, timeout, executor, llm_opts, _depth, max_depth=None):
@@ -273,7 +273,7 @@ def reap(max_age_seconds=3600):
 
 
 def work_once(limit=None, timeout=DEFAULT_TIMEOUT, executor="deterministic", llm_opts=None, api=None):
-    lock = open(LOCK_FILE, "w")
+    lock = open(LOCK_FILE, "w")  # noqa: SIM115 - lock handle must stay open across the whole function
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

@@ -55,6 +55,7 @@ def drop(goal_id):
 def _set_status(goal_id, status):
     if not os.path.exists(GOALS_FILE):
         return {"ok": False, "error": f"no goal {goal_id}"}
+    import tempfile
     updated = []
     found = False
     with open(GOALS_FILE) as f:
@@ -70,7 +71,14 @@ def _set_status(goal_id, status):
             updated.append(goal)
     if not found:
         return {"ok": False, "error": f"no goal {goal_id}"}
-    with open(GOALS_FILE, "w") as f:
-        for goal in updated:
-            f.write(json.dumps(goal) + "\n")
+    # Atomic write: temp file + os.replace to prevent corruption on kill
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(GOALS_FILE))
+    try:
+        with os.fdopen(fd, "w") as f:
+            for g in updated:
+                f.write(json.dumps(g) + "\n")
+        os.replace(tmp, GOALS_FILE)
+    except BaseException:
+        os.unlink(tmp)
+        raise
     return {"ok": True, "id": goal_id, "status": status}

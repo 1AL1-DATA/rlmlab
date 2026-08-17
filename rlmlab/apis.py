@@ -17,6 +17,7 @@ live view of which APIs are reachable.
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HOME = os.environ.get("RLMLAB_HOME", os.path.expanduser("~/.rlmlab"))
@@ -45,15 +46,24 @@ def _load():
 
 
 def _save(state):
-    _ensure()
-    with open(APIS_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    import tempfile
+    os.makedirs(HOME, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=HOME)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, APIS_FILE)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def _probe(base_url, path="", timeout=2):
     """True if the endpoint answers a lightweight HTTP request."""
+    if urllib.parse.urlparse(base_url).scheme not in ("http", "https"):
+        return False
     try:
-        with urllib.request.urlopen(base_url.rstrip("/") + path, timeout=timeout) as resp:
+        with urllib.request.urlopen(base_url.rstrip("/") + path, timeout=timeout) as resp:  # nosec B310 - scheme validated above (http/https only)
             return resp.status < 400
     except (urllib.error.URLError, OSError, TimeoutError):
         return False
@@ -66,12 +76,21 @@ _PROBE_PATHS = {
 
 
 def auto_discover():
-    """Probe llama + ollama defaults; return {name: config} for live ones."""
+    """Probe llama + ollama defaults and scan common ports for live endpoints.
+    Returns {name: config} for all discovered instances."""
     found = {}
+    # Defaults
     for api_type, cfg in (("llama", DEFAULT_LLAMA), ("ollama", DEFAULT_OLLAMA)):
         if _probe(cfg["base_url"], _PROBE_PATHS[api_type]):
             name = "llama-8080" if api_type == "llama" else "ollama"
             found[name] = {"type": api_type, **{k: v for k, v in cfg.items() if k != "type"}}
+    # Scan common ports (ponytail: 8080+11434 are already in defaults, scan 8000-8100)
+    for port in range(8000, 8100, 10):
+        url = f"http://127.0.0.1:{port}"
+        for api_type, path in (("llama", "/health"), ("ollama", "/api/tags")):
+            if _probe(url, path):
+                name = f"{api_type}-{port}"
+                found[name] = {"type": api_type, "base_url": url}
     return found
 
 

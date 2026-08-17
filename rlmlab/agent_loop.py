@@ -14,6 +14,7 @@ output cap, and a max completion size.
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import kernel, subagents
@@ -53,17 +54,18 @@ def _extract_json(content):
     # Strip markdown code block
     if text.startswith("```"):
         lines = text.splitlines()
-        text = "\n".join(lines[1:])
-        text = text.rstrip("\n").rstrip("```").strip()
+        text = "\n".join(lines[1:]).strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
     # Fallback: find the largest valid JSON object
     for start_idx, c1 in enumerate(text):
-        if c1 == "{":
+        if c1 == "{" or c1 == "[":
             for end_idx in range(len(text) - 1, start_idx, -1):
-                if text[end_idx] == "}":
+                if text[end_idx] in "}]":
                     try:
                         return json.loads(text[start_idx:end_idx + 1])
                     except json.JSONDecodeError:
@@ -72,6 +74,8 @@ def _extract_json(content):
 
 
 def _complete(base_url, model, messages, timeout=120):
+    if urllib.parse.urlparse(base_url).scheme not in ("http", "https"):
+        raise ValueError(f"unsupported base_url scheme: {base_url!r}")
     body = json.dumps(
         {
             "model": model,
@@ -86,7 +90,7 @@ def _complete(base_url, model, messages, timeout=120):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - scheme validated above (http/https only)
         data = json.loads(resp.read())
     message = data["choices"][0]["message"]
     usage = data.get("usage", {})
