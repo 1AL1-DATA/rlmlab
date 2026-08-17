@@ -1,4 +1,4 @@
-# rlmlab
+# rlmlab #TODO test gates. content
 
 A recursive language-machine harness (prime-agent style): persistent IPython
 kernels + a continual harness + recursive subagents, driven by a local model
