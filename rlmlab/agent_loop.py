@@ -45,22 +45,29 @@ SYSTEM_PROMPT = (
 
 
 def _extract_json(content):
+    """Extract JSON from model output. Handles markdown code blocks and
+    falls back to bracket-search for mangled output."""
+    if content is None:
+        return None
     text = content.strip()
+    # Strip markdown code block
     if text.startswith("```"):
         lines = text.splitlines()
-        text = "\n".join(lines[1:] if lines and lines[0].startswith("```") else lines)
-        if text.endswith("```"):
-            text = text[:-3].strip()
+        text = "\n".join(lines[1:])
+        text = text.rstrip("\n").rstrip("```").strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                return None
+        pass
+    # Fallback: find the largest valid JSON object
+    for start_idx, c1 in enumerate(text):
+        if c1 == "{":
+            for end_idx in range(len(text) - 1, start_idx, -1):
+                if text[end_idx] == "}":
+                    try:
+                        return json.loads(text[start_idx:end_idx + 1])
+                    except json.JSONDecodeError:
+                        pass
     return None
 
 
@@ -105,18 +112,13 @@ def run_llm(
     wait_child=None,
     extra_system=None,
 ):
-    system = SYSTEM_PROMPT + (("\n\n" + extra_system) if extra_system else "")
+    system = SYSTEM_PROMPT + ("\n\n" + extra_system) if extra_system else SYSTEM_PROMPT
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": prompt},
     ]
     start = time.time()
     total_tokens = 0
-
-    def _reply_ok(doc):
-        messages.append({"role": "assistant", "content": content})
-        messages.append({"role": "user", "content": json.dumps(doc, ensure_ascii=False)})
-        return None
 
     for turn in range(max_turns):
         if time.time() - start > max_seconds:

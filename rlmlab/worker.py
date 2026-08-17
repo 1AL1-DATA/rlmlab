@@ -135,11 +135,11 @@ def _distill_feedback(record, ok, text):
         pass
 
 
-def _wait_child(child_id, timeout, executor, llm_opts, _depth):
-    """Synchronously drain a pending child so a parent can block on it.
-    Recursion is bounded by max_depth (enforced at run_child time) plus a
-    hard cap here. Runs inside the worker's flock, so no double-claim."""
-    if _depth > 6:
+def _wait_child(child_id, timeout, executor, llm_opts, _depth, max_depth=None):
+    """Synchronously drain a pending child so a parent can block on it."""
+    if max_depth is None:
+        max_depth = llm_opts.get("max_depth", agent_loop.DEFAULT_MAX_DEPTH)
+    if _depth > max_depth:
         return subagents.child_result(child_id)
     deadline = time.time() + min(llm_opts.get("max_seconds", 300), 600)
     while time.time() < deadline:
@@ -161,7 +161,7 @@ def _process_one(record, timeout, executor, llm_opts, _depth=0):
         return {"ok": False, "error": "missing prompt.txt"}
 
     resolved = apis.resolve(record.get("api") or "deterministic") or {"executor": "deterministic"}
-    executor = resolved.get("executor") or executor
+    executor = resolved.get("executor", executor)
     llm_opts = {**(llm_opts or {})}
     for key in ("base_url", "model"):
         if resolved.get(key):
