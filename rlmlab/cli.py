@@ -8,7 +8,7 @@ import argparse
 import json
 import sys
 
-from . import __version__, apis, goals, harness, kernel, subagents, worker
+from . import __version__, apis, compaction, goals, harness, kernel, subagents, worker
 
 PROTO_VERSION = "1"
 
@@ -90,6 +90,14 @@ def main(argv=None):
 
     sub.add_parser("schema", parents=[common])
 
+    p = sub.add_parser("compact", help="opencode-style context compaction", parents=[common])
+    p.add_argument("file", nargs="?", default="-", help="messages JSON file, or - for stdin")
+    p.add_argument("--context-length", type=int, default=compaction.CompactionConfig().context_length)
+    p.add_argument("--buffer-tokens", type=int, default=compaction.CompactionConfig().buffer_tokens)
+    p.add_argument("--tail-token-budget", type=int, default=compaction.CompactionConfig().tail_token_budget)
+    p.add_argument("--prune", action="store_true", help="blank old tool output before compacting")
+    p.add_argument("--out", default=None, help="write compacted messages JSON to FILE (default: stdout)")
+
     p = sub.add_parser("apis", help="named executor/API registry", parents=[common])
     a_s = p.add_subparsers(dest="action", required=True)
     a_s.add_parser("list", parents=[common])
@@ -131,7 +139,7 @@ def main(argv=None):
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print_human(args.tool, getattr(args, "action", None), result)
+        print_human(args, result)
     return 0 if isinstance(result, dict) and result.get("ok", True) else 1
 
 
@@ -149,6 +157,8 @@ def dispatch(args):
         return dispatch_rlm(args)
     if tool == "apis":
         return dispatch_apis(args)
+    if tool == "compact":
+        return dispatch_compact(args)
     if tool == "work":
         return dispatch_work(args)
     return {"ok": False, "error": f"unknown tool {tool}"}
@@ -252,6 +262,46 @@ def dispatch_apis(args):
     return {"ok": False, "error": "unknown apis action"}
 
 
+def dispatch_compact(args):
+    """Run opencode-style compaction over a messages JSON file.
+
+    Reads a JSON list of OpenAI-ish message dicts, optionally prunes old tool
+    output, then compacts when the request overflows the usable window
+    (context_length - buffer_tokens). Writes the compacted list to --out or
+    stdout and returns the compaction meta alongside.
+    """
+    try:
+        if args.file == "-":
+            raw = sys.stdin.read()
+        else:
+            with open(args.file, encoding="utf-8") as f:
+                raw = f.read()
+        messages = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error": f"cannot read messages: {e}"}
+    if not isinstance(messages, list):
+        return {"ok": False, "error": "messages file must be a JSON list"}
+
+    cfg = compaction.CompactionConfig(
+        context_length=args.context_length,
+        buffer_tokens=args.buffer_tokens,
+        tail_token_budget=args.tail_token_budget,
+    )
+    if args.prune:
+        messages, prune_meta = compaction.prune(messages, cfg)
+    compacted, meta = compaction.compact(messages, cfg)
+    meta["prune"] = prune_meta if args.prune else None
+
+    payload = json.dumps(compacted, ensure_ascii=False, indent=2)
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(payload + "\n")
+        except OSError as e:
+            return {"ok": False, "error": f"cannot write --out: {e}"}
+    return {"ok": True, "messages": compacted, "meta": meta}
+
+
 def dispatch_work(args):
     llm_opts = {}
     for key in ("model", "base_url", "max_turns", "max_seconds"):
@@ -309,10 +359,14 @@ def build_schema():
         "work.supervise": {"args": {"interval": "int?", "timeout": "int?", "executor": "deterministic|llm",
                                     "api": "string?", "model": "string?", "base_url": "string?",
                                     "max_turns": "int?", "max_seconds": "int?"}},
+        "compact": {"args": {"file": "string", "context_length": "int?", "buffer_tokens": "int?",
+                             "tail_token_budget": "int?", "prune": "bool?", "out": "string?"}},
     }
 
 
-def print_human(tool, action, result):
+def print_human(args, result):
+    tool = args.tool
+    action = getattr(args, "action", None)
     if isinstance(result, dict) and result.get("ok") is False:
         print(f"ERROR: {result.get('error')}", file=sys.stderr)
         return
@@ -383,6 +437,14 @@ def print_human(tool, action, result):
                 else:
                     print(f"  FAIL {r.get('child')}: {r.get('error','')[:80]}")
             print(f"processed {len(result['processed'])} subagent(s)")
+    elif tool == "compact":
+        meta = result.get("meta", {})
+        if meta.get("compacted"):
+            print(f"compacted: {meta.get('head_messages')} head messages -> summary "
+                  f"({meta.get('trigger_tokens')} -> {meta.get('tokens_after')} tokens, "
+                  f"tail {meta.get('tail_messages')} verbatim)")
+        else:
+            print(f"no compaction needed: {meta.get('reason')} ({meta.get('tokens_before')} tokens)")
     elif tool == "schema":
         print(json.dumps(result["schema"], indent=2))
 

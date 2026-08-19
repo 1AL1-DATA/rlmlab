@@ -5,6 +5,23 @@ not yet tagged.
 
 ## Unreleased
 
+### Compaction
+- New `rlmlab/compaction.py`: dependency-free, opencode-style context
+  compaction — buffer-based overflow detection (`should_compact` fires when
+  the request exceeds `context_length - buffer_tokens`, so an
+  already-overflowed conversation compacts on the very next check), turn-wise
+  head/tail selection that keeps the newest turns within `tail_token_budget`
+  verbatim (oldest kept turn may be split, never opens on a bare tool result),
+  OpenAI-style serialization with tool output truncation, running-summary
+  folding (a prior summary is updated, not restacked), a deterministic
+  summarizer fallback plus an injectable LLM summarizer, and tool-output
+  pruning that blanks old results past a threshold while protecting named
+  tools (default `skill`). Defaults target an 80K window with a 20K buffer
+  (fires at 60K) and a guaranteed 20K verbatim tail.
+- New `rlmlab compact` CLI subcommand: reads a messages JSON file (or stdin),
+  optionally prunes, then compacts; `--json` returns the compacted messages
+  plus overflow meta, `--out` writes the result to a file.
+
 ### Kernels
 - Dill-based snapshot/restore: `kernel snapshot --session S` and
   `kernel restore --session S`. Each kernel snapshots its user namespace
