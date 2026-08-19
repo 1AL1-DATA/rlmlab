@@ -126,3 +126,32 @@ def test_compact_deterministic_fallback_no_llm():
     assert meta["compacted"] is True
     assert meta["method"] == "deterministic"
     assert "[Condensed earlier conversation]" in out[0]["content"]
+
+
+def test_build_opencode_prompt_first_compaction():
+    prompt = c.build_opencode_prompt("head text")
+    assert "<conversation>\nhead text\n</conversation>" in prompt
+    assert "<prior-summary>" not in prompt
+    assert "## Objective" in prompt
+    assert "## Work State" in prompt and "### Completed" in prompt
+    assert "## Next Move" in prompt and "## Relevant Files" in prompt
+    assert "Create a new anchored summary" in prompt
+
+
+def test_build_opencode_prompt_prior_summary_update():
+    prompt = c.build_opencode_prompt("head text", "PRIOR SUMMARY")
+    assert "<prior-summary>\nPRIOR SUMMARY\n</prior-summary>" in prompt
+    assert "SUMMARY_UPDATE_INSTRUCTIONS" not in prompt
+    # update instructions injected, not the fresh-anchor phrasing
+    assert "discarded after this" in prompt
+    assert "Create a new anchored summary" not in prompt
+
+
+def test_opencode_summary_message_is_foldable():
+    """A summary in opencode format must be found by fold_prior_summary so a
+    later /compact updates it instead of stacking a fresh one."""
+    head = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "## Objective\n- thing\n\n## Next Move\n1. step"},
+    ]
+    assert c.fold_prior_summary(head) == "## Objective\n- thing\n\n## Next Move\n1. step"
